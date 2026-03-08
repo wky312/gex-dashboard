@@ -1,316 +1,458 @@
 """
-GEX Dashboard — Streamlit app for Dealer Gamma Exposure analysis.
+GEX Dashboard — Dealer Gamma Exposure web dashboard.
 """
 
 import streamlit as st
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
 from gex import fetch_gex, fetch_multi_gex
+from interpret import interpret_gex
 
 # ── Page config ───────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="GEX Dashboard",
+    page_title="GEX Dashboard · Dealer Gamma Exposure",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-SYMBOLS = {
-    'SPY': 'S&P 500 ETF',
-    'QQQ': 'Nasdaq 100 ETF',
-    'IWM': 'Russell 2000 ETF',
-    'DIA': 'Dow Jones ETF',
-}
+# ── Custom CSS for web-page feel ──────────────────────────────────────────
 
-REGIME_COLORS = {
-    'positive': '#22c55e',
-    'negative': '#ef4444',
-    'neutral': '#94a3b8',
-}
-REGIME_LABELS = {
-    'positive': '正 Gamma（低波動，均值回歸）',
-    'negative': '負 Gamma（高波動，趨勢加速）',
-    'neutral': '中性',
-}
+st.markdown("""
+<style>
+    /* Hide Streamlit chrome */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+
+    /* Dark theme overrides */
+    .stApp { background: #0d1117; }
+
+    .hero {
+        text-align: center;
+        padding: 1.5rem 0 1rem;
+        border-bottom: 1px solid #21262d;
+        margin-bottom: 1.5rem;
+    }
+    .hero h1 {
+        font-size: 2.2rem;
+        font-weight: 700;
+        color: #e6edf3;
+        margin: 0;
+    }
+    .hero .sub {
+        color: #7d8590;
+        font-size: 0.95rem;
+        margin-top: 0.3rem;
+    }
+
+    /* Metric cards */
+    .metric-row {
+        display: flex; gap: 12px; flex-wrap: wrap;
+        margin-bottom: 1.2rem;
+    }
+    .metric-card {
+        flex: 1; min-width: 150px;
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 10px;
+        padding: 16px 20px;
+    }
+    .metric-card .label { font-size: 0.72rem; color: #7d8590; text-transform: uppercase; letter-spacing: 1px; }
+    .metric-card .value { font-size: 1.5rem; font-weight: 700; color: #e6edf3; margin-top: 4px; }
+    .metric-card .delta { font-size: 0.82rem; margin-top: 2px; }
+    .metric-card .delta.green { color: #3fb950; }
+    .metric-card .delta.red { color: #f85149; }
+    .metric-card .delta.yellow { color: #d29922; }
+
+    /* Interpretation panel */
+    .interp-panel {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 10px;
+        padding: 20px 24px;
+        margin-bottom: 1rem;
+    }
+    .interp-panel h3 {
+        color: #f0883e;
+        font-size: 1rem;
+        margin-bottom: 0.8rem;
+        border-bottom: 1px solid #21262d;
+        padding-bottom: 0.5rem;
+    }
+
+    /* Summary banner */
+    .summary-banner {
+        background: linear-gradient(135deg, #161b22, #1c2333);
+        border: 1px solid #30363d;
+        border-left: 4px solid #f0883e;
+        border-radius: 10px;
+        padding: 18px 24px;
+        font-size: 1.1rem;
+        color: #e6edf3;
+        margin-bottom: 1.2rem;
+    }
+
+    /* Level tags */
+    .level-row {
+        display: flex; align-items: center; gap: 10px;
+        padding: 8px 0;
+        border-bottom: 1px solid #21262d;
+    }
+    .level-row:last-child { border-bottom: none; }
+    .level-tag {
+        display: inline-block;
+        font-size: 0.7rem;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-weight: 600;
+        text-transform: uppercase;
+    }
+    .level-tag.resistance { background: rgba(248,81,73,0.15); color: #f85149; }
+    .level-tag.support { background: rgba(63,185,80,0.15); color: #3fb950; }
+
+    /* Timestamp */
+    .ts { color: #484f58; font-size: 0.75rem; text-align: right; margin-top: 0.5rem; }
+
+    /* Tabs styling */
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] {
+        background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+        padding: 8px 20px; color: #7d8590;
+    }
+    .stTabs [aria-selected="true"] {
+        background: #f0883e !important; color: #fff !important;
+        border-color: #f0883e !important;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Chart builders
 # ══════════════════════════════════════════════════════════════════════════
 
-def make_gex_strike_chart(df: pd.DataFrame, spot: float, kl: dict,
-                           compact: bool = False) -> go.Figure:
+CHART_LAYOUT = dict(
+    template='plotly_dark',
+    paper_bgcolor='rgba(0,0,0,0)',
+    plot_bgcolor='rgba(13,17,23,1)',
+    font=dict(family='Inter, sans-serif', color='#e6edf3'),
+    margin=dict(l=50, r=20, t=30, b=50),
+)
+
+
+def make_gex_strike_chart(df, spot, kl, compact=False):
     fig = go.Figure()
 
-    pos = df['net_gex'].clip(lower=0)
-    neg = df['net_gex'].clip(upper=0)
+    pos = df['net_gex'].clip(lower=0) / 1e6
+    neg = df['net_gex'].clip(upper=0) / 1e6
 
     fig.add_trace(go.Bar(
-        x=df['strike'], y=pos, name='正 GEX',
-        marker_color='rgba(34,197,94,0.7)',
+        x=df['strike'], y=pos, name='正 GEX（穩定）',
+        marker_color='rgba(63,185,80,0.7)',
+        hovertemplate='Strike: $%{x:,.0f}<br>GEX: +%{y:,.0f}M<extra></extra>',
     ))
     fig.add_trace(go.Bar(
-        x=df['strike'], y=neg, name='負 GEX',
-        marker_color='rgba(239,68,68,0.7)',
+        x=df['strike'], y=neg, name='負 GEX（不穩定）',
+        marker_color='rgba(248,81,73,0.7)',
+        hovertemplate='Strike: $%{x:,.0f}<br>GEX: %{y:,.0f}M<extra></extra>',
     ))
 
-    fig.add_vline(x=spot, line_dash="dash", line_color="#60a5fa",
-                  annotation_text=f"Spot ${spot:,.1f}" if not compact else None)
+    fig.add_vline(x=spot, line_dash="dash", line_color="#58a6ff", line_width=2,
+                  annotation_text=f"Spot ${spot:,.1f}" if not compact else None,
+                  annotation_font_color="#58a6ff")
 
     if kl.get('gamma_flip'):
-        fig.add_vline(x=kl['gamma_flip'], line_dash="dot", line_color="#f59e0b",
-                      annotation_text=f"Flip ${kl['gamma_flip']:,.1f}" if not compact else None)
+        fig.add_vline(x=kl['gamma_flip'], line_dash="dot", line_color="#d29922", line_width=2,
+                      annotation_text=f"Flip ${kl['gamma_flip']:,.0f}" if not compact else None,
+                      annotation_font_color="#d29922")
 
     if kl.get('put_wall') and not compact:
-        fig.add_vline(x=kl['put_wall'], line_dash="dot", line_color="#22c55e",
-                      annotation_text=f"Put Wall ${kl['put_wall']:,.0f}")
+        fig.add_vline(x=kl['put_wall'], line_dash="dot", line_color="#3fb950",
+                      annotation_text=f"Put Wall ${kl['put_wall']:,.0f}",
+                      annotation_font_color="#3fb950", annotation_position="bottom left")
     if kl.get('call_wall') and not compact:
-        fig.add_vline(x=kl['call_wall'], line_dash="dot", line_color="#ef4444",
-                      annotation_text=f"Call Wall ${kl['call_wall']:,.0f}")
+        fig.add_vline(x=kl['call_wall'], line_dash="dot", line_color="#f85149",
+                      annotation_text=f"Call Wall ${kl['call_wall']:,.0f}",
+                      annotation_font_color="#f85149")
 
-    height = 350 if compact else 500
     fig.update_layout(
+        **CHART_LAYOUT,
         barmode='relative',
-        template='plotly_dark',
-        height=height,
-        margin=dict(l=40, r=20, t=30, b=40),
-        xaxis_title="Strike",
-        yaxis_title="Dealer GEX ($)",
-        legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center"),
-        showlegend=not compact,
+        height=420 if not compact else 320,
+        xaxis_title="Strike Price",
+        yaxis_title="Dealer GEX ($ millions)",
+        legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center") if not compact else dict(visible=False),
     )
     return fig
 
 
-def make_gex_expiry_chart(df: pd.DataFrame) -> go.Figure:
+def make_gex_expiry_chart(df):
     fig = go.Figure()
-    colors = ['#22c55e' if v >= 0 else '#ef4444' for v in df['net_gex']]
+    colors = ['#3fb950' if v >= 0 else '#f85149' for v in df['net_gex']]
     fig.add_trace(go.Bar(
-        x=df['expiry'], y=df['net_gex'],
+        x=df['expiry'], y=df['net_gex'] / 1e6,
         marker_color=colors,
+        hovertemplate='%{x}<br>GEX: %{y:,.0f}M<extra></extra>',
     ))
-    fig.update_layout(
-        template='plotly_dark',
-        height=350,
-        margin=dict(l=40, r=20, t=20, b=40),
-        xaxis_title="到期日",
-        yaxis_title="Net GEX ($)",
-    )
+    fig.update_layout(**CHART_LAYOUT, height=320,
+                      xaxis_title="Expiration", yaxis_title="Net GEX ($M)")
     return fig
 
 
-def make_gex_heatmap(raw_df: pd.DataFrame, spot: float) -> go.Figure:
-    mask = (raw_df['strike'] >= spot * 0.90) & (raw_df['strike'] <= spot * 1.10)
+def make_gex_heatmap(raw_df, spot):
+    mask = (raw_df['strike'] >= spot * 0.92) & (raw_df['strike'] <= spot * 1.08)
     df = raw_df[mask].copy()
-
     pivot = df.pivot_table(index='strike', columns='expiry',
-                           values='dealer_gex', aggfunc='sum')
+                           values='dealer_gex', aggfunc='sum') / 1e6
     pivot = pivot.sort_index(ascending=False)
 
     fig = go.Figure(data=go.Heatmap(
-        z=pivot.values,
-        x=pivot.columns,
-        y=pivot.index,
-        colorscale='RdYlGn',
-        zmid=0,
-        colorbar_title="GEX",
+        z=pivot.values, x=pivot.columns, y=[f"${s:,.0f}" for s in pivot.index],
+        colorscale=[[0, '#f85149'], [0.5, '#0d1117'], [1, '#3fb950']],
+        zmid=0, colorbar_title="GEX ($M)",
+        hovertemplate='Strike: %{y}<br>Expiry: %{x}<br>GEX: %{z:,.1f}M<extra></extra>',
     ))
-    fig.update_layout(
-        template='plotly_dark',
-        height=400,
-        margin=dict(l=60, r=20, t=20, b=60),
-        xaxis_title="到期日",
-        yaxis_title="Strike",
-    )
+    fig.update_layout(**CHART_LAYOUT, height=400,
+                      xaxis_title="Expiration", yaxis_title="Strike")
+    return fig
+
+
+def make_call_put_chart(df, spot):
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=df['strike'], y=df['call_gex'] / 1e6, name='Call GEX',
+        marker_color='rgba(248,81,73,0.6)',
+    ))
+    fig.add_trace(go.Bar(
+        x=df['strike'], y=df['put_gex'] / 1e6, name='Put GEX',
+        marker_color='rgba(63,185,80,0.6)',
+    ))
+    fig.add_vline(x=spot, line_dash="dash", line_color="#58a6ff", line_width=1)
+    fig.update_layout(**CHART_LAYOUT, barmode='group', height=350,
+                      xaxis_title="Strike", yaxis_title="GEX ($M)",
+                      legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"))
     return fig
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  Rendering functions
+#  Metric card HTML helpers
 # ══════════════════════════════════════════════════════════════════════════
 
-def render_single(data: dict):
-    symbol = data['symbol']
+def metric_card(label, value, delta=None, delta_color='green'):
+    delta_html = f'<div class="delta {delta_color}">{delta}</div>' if delta else ''
+    return f"""<div class="metric-card">
+        <div class="label">{label}</div>
+        <div class="value">{value}</div>
+        {delta_html}
+    </div>"""
+
+
+def render_metrics_row(data, interp):
     spot = data['spot']
     regime = data['regime']
     kl = data['key_levels']
-    gex_df = data['gex_by_strike']
 
-    st.title(f"📊 {symbol} Gamma Exposure")
+    regime_color = 'green' if regime == 'positive' else 'red'
+    regime_label = '正 GAMMA' if regime == 'positive' else '負 GAMMA'
+    regime_desc = '低波動 · 均值回歸' if regime == 'positive' else '高波動 · 趨勢加速'
 
-    cols = st.columns(5)
-    cols[0].metric("現價", f"${spot:,.2f}")
-    cols[1].metric("Gamma Regime",
-                   regime.upper(),
-                   delta=REGIME_LABELS[regime],
-                   delta_color="normal" if regime == 'positive' else "inverse")
-    cols[2].metric("Gamma Flip",
-                   f"${kl['gamma_flip']:,.1f}" if kl['gamma_flip'] else "N/A",
-                   delta=f"{(kl['gamma_flip']/spot - 1)*100:+.2f}% from spot" if kl['gamma_flip'] else None)
-    cols[3].metric("Put Wall（支撐）",
-                   f"${kl['put_wall']:,.0f}" if kl['put_wall'] else "N/A")
-    cols[4].metric("Call Wall（壓力）",
-                   f"${kl['call_wall']:,.0f}" if kl['call_wall'] else "N/A")
+    flip_val = f"${kl['gamma_flip']:,.1f}" if kl['gamma_flip'] else 'N/A'
+    flip_delta = ''
+    if kl['gamma_flip']:
+        pct = (kl['gamma_flip'] / spot - 1) * 100
+        flip_delta = f"距現價 {pct:+.1f}%"
 
-    st.markdown(f"<small>Risk-free rate: {data['risk_free_rate']*100:.2f}% · "
-                f"Data: {data['timestamp'][:19]} UTC · "
-                f"Source: Yahoo Finance (delayed ~15 min)</small>",
-                unsafe_allow_html=True)
+    pw = f"${kl['put_wall']:,.0f}" if kl['put_wall'] else 'N/A'
+    cw = f"${kl['call_wall']:,.0f}" if kl['call_wall'] else 'N/A'
 
-    # GEX by Strike
-    st.subheader("GEX 分布（by Strike）")
-    fig = make_gex_strike_chart(gex_df, spot, kl)
-    st.plotly_chart(fig, use_container_width=True)
-
-    # GEX by Expiry + Heatmap
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("GEX by 到期日")
-        fig_exp = make_gex_expiry_chart(data['gex_by_expiry'])
-        st.plotly_chart(fig_exp, use_container_width=True)
-    with col2:
-        st.subheader("GEX Heatmap（Strike × Expiry）")
-        fig_heat = make_gex_heatmap(data['raw_options'], spot)
-        st.plotly_chart(fig_heat, use_container_width=True)
-
-    # Key levels table
-    st.subheader("關鍵水位")
-    levels = []
-    for name, key in [("Gamma Flip", 'gamma_flip'), ("Max Gamma Strike", 'max_gamma_strike'),
-                      ("Put Wall（支撐）", 'put_wall'), ("Call Wall（壓力）", 'call_wall')]:
-        val = kl.get(key)
-        levels.append({
-            "水位": name,
-            "價格": f"${val:,.1f}" if val else "N/A",
-            "距現價": f"{(val/spot-1)*100:+.2f}%" if val else "",
-        })
-    st.dataframe(pd.DataFrame(levels), hide_index=True, use_container_width=True)
-
-    # Interpretation
-    with st.expander("解讀說明"):
-        if regime == 'positive':
-            st.markdown("""
-            **正 Gamma 環境** — 造市商會在價格上漲時賣出、下跌時買入，
-            形成「均值回歸」效果，壓低盤中波動。價格傾向被吸引到 Max Gamma Strike 附近。
-            """)
-        else:
-            st.markdown("""
-            **負 Gamma 環境** — 造市商被迫追高殺低（上漲時買、下跌時賣），
-            形成正回饋循環，放大價格波動。突破 Gamma Flip 水位後波動可能急劇增加。
-            """)
+    html = f"""<div class="metric-row">
+        {metric_card('現價', f'${spot:,.2f}')}
+        {metric_card('Gamma Regime', regime_label, regime_desc, regime_color)}
+        {metric_card('Gamma Flip', flip_val, flip_delta, 'yellow')}
+        {metric_card('Put Wall（支撐）', pw, '', 'green')}
+        {metric_card('Call Wall（壓力）', cw, '', 'red')}
+    </div>"""
+    st.markdown(html, unsafe_allow_html=True)
 
 
-def render_multi(results: dict):
-    st.title("📊 多標的 GEX 比較")
+# ══════════════════════════════════════════════════════════════════════════
+#  Render single symbol
+# ══════════════════════════════════════════════════════════════════════════
 
+def render_single(data):
+    interp = interpret_gex(data)
+
+    # Summary banner
+    st.markdown(f'<div class="summary-banner">{interp["summary"]}</div>', unsafe_allow_html=True)
+
+    # Metrics
+    render_metrics_row(data, interp)
+
+    # Two-column layout: Chart (left) + Interpretation (right)
+    col_chart, col_interp = st.columns([3, 2])
+
+    with col_chart:
+        fig = make_gex_strike_chart(data['gex_by_strike'], data['spot'], data['key_levels'])
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_interp:
+        # Regime analysis
+        st.markdown(f"""<div class="interp-panel">
+            <h3>📡 Gamma 環境分析</h3>
+            {interp['regime_analysis']}
+        </div>""", unsafe_allow_html=True)
+
+        # Volatility outlook
+        st.markdown(f"""<div class="interp-panel">
+            <h3>📈 波動率展望</h3>
+            {interp['volatility_outlook']}
+        </div>""", unsafe_allow_html=True)
+
+    # Support / Resistance + Scenarios
+    col_sr, col_sc = st.columns([1, 1])
+
+    with col_sr:
+        st.markdown(f"""<div class="interp-panel">
+            <h3>🎯 支撐與壓力位</h3>
+            {interp['support_resistance']}
+        </div>""", unsafe_allow_html=True)
+
+    with col_sc:
+        st.markdown(f"""<div class="interp-panel">
+            <h3>⚡ 關鍵情境</h3>
+            {interp['key_scenarios']}
+        </div>""", unsafe_allow_html=True)
+
+    # Detailed charts in tabs
+    st.markdown("---")
+    tab1, tab2, tab3 = st.tabs(["Call vs Put GEX", "到期日分布", "GEX Heatmap"])
+
+    with tab1:
+        fig = make_call_put_chart(data['gex_by_strike'], data['spot'])
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab2:
+        fig = make_gex_expiry_chart(data['gex_by_expiry'])
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab3:
+        fig = make_gex_heatmap(data['raw_options'], data['spot'])
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Footer
+    st.markdown(f"""<div class="ts">
+        Risk-free rate: {data['risk_free_rate']*100:.2f}% (FRED 3M T-Bill) ·
+        Data: {data['timestamp'][:19]} UTC ·
+        Source: Yahoo Finance (delayed ~15 min) ·
+        GEX = OI × Γ × 100 × S² × 0.01
+    </div>""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Render multi-symbol comparison
+# ══════════════════════════════════════════════════════════════════════════
+
+def render_multi(results):
+    st.markdown('<div class="hero"><h1>📊 多標的 GEX 比較</h1></div>', unsafe_allow_html=True)
+
+    # Summary table
     rows = []
     for sym, data in results.items():
         if 'error' in data:
-            rows.append({'標的': sym, '狀態': f"Error: {data['error']}"})
+            rows.append({'標的': sym, 'Regime': f"❌ {data['error']}"})
             continue
         kl = data['key_levels']
+        r = data['regime']
         rows.append({
             '標的': sym,
             '現價': f"${data['spot']:,.2f}",
-            'Regime': data['regime'].upper(),
-            'Total GEX': f"{data['total_gex']:,.0f}",
-            'Gamma Flip': f"${kl['gamma_flip']:,.1f}" if kl['gamma_flip'] else "N/A",
-            'Put Wall': f"${kl['put_wall']:,.0f}" if kl['put_wall'] else "N/A",
-            'Call Wall': f"${kl['call_wall']:,.0f}" if kl['call_wall'] else "N/A",
+            'Regime': f"{'🟢' if r=='positive' else '🔴'} {r.upper()}",
+            'Total GEX': f"{data['total_gex']/1e9:+.2f}B",
+            'Gamma Flip': f"${kl['gamma_flip']:,.0f}" if kl['gamma_flip'] else "N/A",
+            'Put Wall': f"${kl['put_wall']:,.0f}" if kl['put_wall'] else "—",
+            'Call Wall': f"${kl['call_wall']:,.0f}" if kl['call_wall'] else "—",
         })
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
+    # Charts grid
     valid = {s: d for s, d in results.items() if 'error' not in d}
     if not valid:
         return
 
-    n = len(valid)
-    cols = st.columns(min(n, 3))
+    cols = st.columns(min(len(valid), 3))
     for i, (sym, data) in enumerate(valid.items()):
         with cols[i % len(cols)]:
-            st.subheader(f"{sym}")
+            interp = interpret_gex(data)
             regime = data['regime']
-            color = REGIME_COLORS[regime]
-            st.markdown(f"<span style='color:{color};font-weight:bold'>{regime.upper()}</span> · "
-                        f"Spot ${data['spot']:,.2f}",
-                        unsafe_allow_html=True)
+            emoji = '🟢' if regime == 'positive' else '🔴'
+            st.markdown(f"### {emoji} {sym} · ${data['spot']:,.2f}")
             fig = make_gex_strike_chart(data['gex_by_strike'], data['spot'],
                                          data['key_levels'], compact=True)
             st.plotly_chart(fig, use_container_width=True)
+            st.markdown(f"<small>{interp['summary']}</small>", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  Main flow
+#  Main
 # ══════════════════════════════════════════════════════════════════════════
 
-# ── Sidebar ───────────────────────────────────────────────────────────────
+SYMBOLS = {'SPY': 'S&P 500', 'QQQ': 'Nasdaq 100', 'IWM': 'Russell 2000', 'DIA': 'Dow Jones'}
 
-st.sidebar.title("GEX Dashboard")
-st.sidebar.markdown("Dealer Gamma Exposure Analysis")
+# Top bar as tabs instead of sidebar
+st.markdown("""<div class="hero">
+    <h1>📊 Dealer Gamma Exposure Dashboard</h1>
+    <div class="sub">造市商 Gamma 曝險分析 · 支撐壓力位識別 · 市場環境解讀</div>
+</div>""", unsafe_allow_html=True)
 
-mode = st.sidebar.radio("模式", ["單一標的", "多標的比較"], index=0)
+# Controls in columns
+c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
+with c1:
+    mode = st.radio("模式", ["單一標的分析", "多標的比較"], horizontal=True, label_visibility="collapsed")
+with c2:
+    if mode == "單一標的分析":
+        symbol = st.selectbox("標的", list(SYMBOLS.keys()),
+                               format_func=lambda s: f"{s} — {SYMBOLS[s]}",
+                               label_visibility="collapsed")
+    else:
+        symbols = st.multiselect("標的", list(SYMBOLS.keys()),
+                                  default=["SPY", "QQQ", "IWM"],
+                                  format_func=lambda s: f"{s}",
+                                  label_visibility="collapsed")
+with c3:
+    max_exp = st.selectbox("到期日數", [6, 10, 15, 20], index=1, label_visibility="collapsed",
+                            format_func=lambda x: f"{x} 個到期日")
+with c4:
+    run = st.button("🔍 計算 GEX", type="primary", use_container_width=True)
 
-if mode == "單一標的":
-    symbol = st.sidebar.selectbox("標的", list(SYMBOLS.keys()), index=0,
-                                   format_func=lambda s: f"{s} — {SYMBOLS[s]}")
-    custom = st.sidebar.text_input("自訂標的（留空用上方選擇）", "")
-    if custom.strip():
-        symbol = custom.strip().upper()
-    symbols = None
-else:
-    symbols = st.sidebar.multiselect("標的", list(SYMBOLS.keys()),
-                                      default=["SPY", "QQQ", "IWM"],
-                                      format_func=lambda s: f"{s} — {SYMBOLS[s]}")
-    symbol = None
-
-max_exp = st.sidebar.slider("最大到期日數量", 4, 20, 10,
-                             help="越多越精確但越慢")
-
-run = st.sidebar.button("計算 GEX", type="primary", use_container_width=True)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("""
-**公式**
-`GEX = OI × Gamma × 100 × S² × 0.01`
-
-Dealer 賣出 Call → 負 Gamma
-Dealer 賣出 Put → 正 Gamma
-
-**正 Gamma 環境**: 造市商賣高買低，壓縮波動
-**負 Gamma 環境**: 造市商追高殺低，放大波動
-**Gamma Flip**: 正負翻轉的價格水位
-""")
-
-# ── Main content ──
+st.markdown("---")
 
 if not run:
-    st.title("📊 Dealer Gamma Exposure (GEX) Dashboard")
     st.markdown("""
-    點擊左側 **「計算 GEX」** 開始分析。
-
-    本工具從 Yahoo Finance 取得選擇權資料，計算造市商（Dealer）的 Gamma Exposure 分布，
-    識別 **Gamma Flip**（正負翻轉水位）、**Put Wall**（支撐）和 **Call Wall**（壓力）。
-
-    > **資料延遲約 15-20 分鐘**（Yahoo Finance 免費數據限制）
-    """)
+    <div style="text-align:center; color:#7d8590; padding: 3rem 0;">
+        <p style="font-size: 1.2rem;">👆 選擇標的後點擊「計算 GEX」</p>
+        <p style="font-size: 0.9rem; max-width: 600px; margin: 1rem auto;">
+            本工具分析造市商的 Gamma Exposure 分布，識別 Gamma Flip（正負翻轉水位）、
+            Put Wall（支撐）和 Call Wall（壓力），並提供市場環境解讀。
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
     st.stop()
 
-if mode == "單一標的":
-    with st.spinner(f"正在計算 {symbol} 的 GEX..."):
+if mode == "單一標的分析":
+    with st.spinner(f"正在分析 {symbol}..."):
         try:
             data = fetch_gex(symbol, max_expirations=max_exp)
         except Exception as e:
-            st.error(f"計算失敗: {e}")
+            st.error(f"分析失敗: {e}")
             st.stop()
     render_single(data)
-
-elif mode == "多標的比較":
+else:
     if not symbols:
         st.warning("請至少選擇一個標的")
         st.stop()
-    with st.spinner(f"正在計算 {', '.join(symbols)} 的 GEX..."):
+    with st.spinner(f"正在分析 {', '.join(symbols)}..."):
         results = fetch_multi_gex(symbols, max_expirations=max_exp)
     render_multi(results)
